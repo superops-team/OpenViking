@@ -304,6 +304,78 @@ export function sanitizeOpenVikingAgentIdHeader(raw: string): string {
   return normalized.length > 0 ? normalized : "ov_agent";
 }
 
+export type PeerRole = "none" | "assistant" | "person";
+
+export type OVMemoryPolicy = {
+  self?: { enabled?: boolean };
+  peer?: { enabled?: boolean };
+  memory_types?: string[];
+};
+
+export function sanitizeOpenVikingPeerId(raw: string | undefined): string | undefined {
+  const trimmed = raw?.trim() ?? "";
+  if (!trimmed) {
+    return undefined;
+  }
+  const normalized = trimmed
+    .replace(/[^a-zA-Z0-9_-]/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function encodePeerSegment(raw: string | undefined): string | undefined {
+  const trimmed = raw?.trim() ?? "";
+  if (!trimmed) {
+    return undefined;
+  }
+  return `b64_${Buffer.from(trimmed, "utf8").toString("base64url")}`;
+}
+
+export function buildPrefixedPeerId(prefix: string, raw: string | undefined): string | undefined {
+  const peerId = encodePeerSegment(raw);
+  if (!peerId) {
+    return undefined;
+  }
+  const cleanPrefix = encodePeerSegment(prefix);
+  return cleanPrefix ? `${cleanPrefix}__${peerId}` : peerId;
+}
+
+export function resolveMessagePeerId(params: {
+  peerRole: PeerRole;
+  messageRole: string;
+  personPeerId?: string;
+  assistantPeerId?: string;
+}): string | undefined {
+  if (params.peerRole === "person" && params.messageRole === "user") {
+    return sanitizeOpenVikingPeerId(params.personPeerId);
+  }
+  if (params.peerRole === "assistant" && params.messageRole === "assistant") {
+    return sanitizeOpenVikingPeerId(params.assistantPeerId);
+  }
+  return undefined;
+}
+
+export function resolveSearchActorPeerId(params: {
+  peerRole: PeerRole;
+  personPeerId?: string;
+  assistantPeerId?: string;
+}): string | undefined {
+  if (params.peerRole === "person") {
+    return sanitizeOpenVikingPeerId(params.personPeerId);
+  }
+  if (params.peerRole === "assistant") {
+    return sanitizeOpenVikingPeerId(params.assistantPeerId);
+  }
+  return undefined;
+}
+
+export function defaultMemoryPolicyForPeerRole(peerRole: PeerRole): OVMemoryPolicy | undefined {
+  if (peerRole === "none") {
+    return undefined;
+  }
+  return { self: { enabled: true }, peer: { enabled: true } };
+}
+
 export function tokenizeCommandArgs(args: string): string[] {
   const tokens: string[] = [];
   let current = "";
@@ -710,6 +782,11 @@ const contextEnginePlugin = {
         routingDebugLog,
         cfg.isolateUserScopeByAgent,
         cfg.isolateAgentScopeByUser,
+        {
+          authMode: cfg.authMode,
+          actorPeerId: cfg.actor_peer_id,
+          legacyAgentId: cfg.agent_id,
+        },
       ),
     );
 
@@ -738,6 +815,11 @@ const contextEnginePlugin = {
       abstractPreview: previewText(item.abstract || item.overview, cfg.traceRecallPreviewChars),
       resultType,
     });
+
+    const isUserMemoryTargetUri = (uri: string): boolean => {
+      const trimmed = uri.trim().replace(/\/+$/, "");
+      return /^viking:\/\/user(?:\/.*)?\/memories(?:\/.*)?$/.test(trimmed);
+    };
 
     const parseRecallTraceInput = (
       input: RecallTraceToolInput,
@@ -1447,6 +1529,11 @@ const contextEnginePlugin = {
           const requestLimit = Math.max(limit * 4, 20);
 
           const recallClient = await getClient();
+          const actorPeerId = cfg.actor_peer_id || resolveSearchActorPeerId({
+            peerRole: cfg.peer_role ?? "none",
+            personPeerId: buildPrefixedPeerId(cfg.peer_prefix ?? "", ctx?.senderId),
+            assistantPeerId: buildPrefixedPeerId(cfg.peer_prefix ?? "", session.agentId),
+          });
           if (cfg.logFindRequests) {
             api.logger.info(
               `openviking: memory_recall X-OpenViking-Agent="${session.agentId}" ` +
@@ -1458,12 +1545,16 @@ const contextEnginePlugin = {
           let memoryRecallSearches: RecallTraceEntry["searches"] = [];
           if (targetUri) {
             // 如果指定了目标 URI，只检索该位置
+            const explicitResourceType = inferRecallResourceType(targetUri);
+            const useActorPeerMemoryContext = Boolean(actorPeerId && isUserMemoryTargetUri(targetUri));
             result = await recallClient.find(
               query,
               {
-                targetUri,
+                targetUri: useActorPeerMemoryContext ? "" : targetUri,
+                ...(useActorPeerMemoryContext ? { contextType: "memory" as const } : {}),
                 limit: requestLimit,
                 scoreThreshold: 0,
+                ...(actorPeerId ? { actorPeerId } : {}),
               },
               session.agentId,
             );
@@ -1472,9 +1563,9 @@ const contextEnginePlugin = {
               ...(result.resources ?? []).map((item) => toTraceResult(item, "resource")),
             ].slice(0, cfg.traceRecallMaxResultsPerSearch);
             memoryRecallSearches = [{
-              resourceType: inferRecallResourceType(targetUri) ?? "resource",
+              resourceType: explicitResourceType ?? "resource",
               targetUriInput: targetUri,
-              targetUriResolved: targetUri,
+              targetUriResolved: useActorPeerMemoryContext ? "" : targetUri,
               limit: requestLimit,
               scoreThreshold,
               durationMs: 0,
@@ -1490,7 +1581,8 @@ const contextEnginePlugin = {
               recallClient.find(
                 query,
                 {
-                  targetUri: search.targetUri,
+                  targetUri: actorPeerId && search.resourceType === "user" ? "" : search.targetUri,
+                  ...(actorPeerId && search.resourceType === "user" ? { contextType: "memory" as const, actorPeerId } : {}),
                   limit: requestLimit,
                   scoreThreshold: 0,
                 },
@@ -1764,7 +1856,22 @@ const contextEnginePlugin = {
               sessionId = `memory-store-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
               usedTempSession = true;
             }
-            const roleId = role === "user" ? toRoleId(extractToolSenderId(ctx)) : undefined;
+            const peerRole = cfg.peer_role ?? "none";
+            const memoryPolicy = defaultMemoryPolicyForPeerRole(peerRole);
+            if (memoryPolicy) {
+              await c.ensureSessionWithMemoryPolicy(sessionId, {
+                agentId: session.agentId,
+                memoryPolicy,
+              });
+            }
+            const roleId = peerRole === "none"
+              ? (role === "user" ? toRoleId(extractToolSenderId(ctx)) : undefined)
+              : resolveMessagePeerId({
+                  peerRole,
+                  messageRole: role,
+                  personPeerId: buildPrefixedPeerId(cfg.peer_prefix ?? "", extractToolSenderId(ctx)),
+                  assistantPeerId: buildPrefixedPeerId(cfg.peer_prefix ?? "", session.agentId),
+                });
             await c.addSessionMessage(
               sessionId,
               role,

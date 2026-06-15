@@ -234,6 +234,7 @@ export async function buildAutoRecallContext(params: {
   rawUserTextPreview?: string;
   queryTruncated?: boolean;
   resourceTypes?: RecallResourceType[];
+  actorPeerId?: string;
 }): Promise<{ block?: string; memoryCount: number; estimatedTokens: number }> {
   const { cfg, client, agentId, queryText, logger, verbose } = params;
 
@@ -271,7 +272,8 @@ export async function buildAutoRecallContext(params: {
       }>[] = searchPlan.searches.map(async (search) => {
         const start = Date.now();
         const result = await client.find(queryText, {
-          targetUri: search.targetUri,
+          targetUri: params.actorPeerId && search.resourceType === "user" ? "" : search.targetUri,
+          ...(params.actorPeerId && search.resourceType === "user" ? { contextType: "memory" as const, actorPeerId: params.actorPeerId } : {}),
           limit: candidateLimit,
           scoreThreshold: 0,
         }, agentId);

@@ -29,6 +29,14 @@ type AgentMessage = {
 
 type ExtractedTurnMessage = ReturnType<typeof extractNewTurnMessages>["messages"][number];
 
+type PeerRole = "none" | "assistant" | "person";
+
+type OVMemoryPolicy = {
+  self?: { enabled?: boolean };
+  peer?: { enabled?: boolean };
+  memory_types?: string[];
+};
+
 type ContextEngineInfo = {
   id: string;
   name: string;
@@ -56,6 +64,70 @@ export function toRoleId(senderId: string | undefined): string | undefined {
     .replace(/^_+|_+$/g, "")
     .replace(/_+/g, "_");
   return normalized || undefined;
+}
+
+function sanitizeOpenVikingPeerId(raw: string | undefined): string | undefined {
+  const trimmed = raw?.trim() ?? "";
+  if (!trimmed) {
+    return undefined;
+  }
+  const normalized = trimmed
+    .replace(/[^a-zA-Z0-9_-]/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function encodePeerSegment(raw: string | undefined): string | undefined {
+  const trimmed = raw?.trim() ?? "";
+  if (!trimmed) {
+    return undefined;
+  }
+  return `b64_${Buffer.from(trimmed, "utf8").toString("base64url")}`;
+}
+
+function buildPrefixedPeerId(prefix: string, raw: string | undefined): string | undefined {
+  const peerId = encodePeerSegment(raw);
+  if (!peerId) {
+    return undefined;
+  }
+  const cleanPrefix = encodePeerSegment(prefix);
+  return cleanPrefix ? `${cleanPrefix}__${peerId}` : peerId;
+}
+
+function resolveMessagePeerId(params: {
+  peerRole: PeerRole;
+  messageRole: string;
+  personPeerId?: string;
+  assistantPeerId?: string;
+}): string | undefined {
+  if (params.peerRole === "person" && params.messageRole === "user") {
+    return sanitizeOpenVikingPeerId(params.personPeerId);
+  }
+  if (params.peerRole === "assistant" && params.messageRole === "assistant") {
+    return sanitizeOpenVikingPeerId(params.assistantPeerId);
+  }
+  return undefined;
+}
+
+function resolveSearchActorPeerId(params: {
+  peerRole: PeerRole;
+  personPeerId?: string;
+  assistantPeerId?: string;
+}): string | undefined {
+  if (params.peerRole === "person") {
+    return sanitizeOpenVikingPeerId(params.personPeerId);
+  }
+  if (params.peerRole === "assistant") {
+    return sanitizeOpenVikingPeerId(params.assistantPeerId);
+  }
+  return undefined;
+}
+
+function defaultMemoryPolicyForPeerRole(peerRole: PeerRole): OVMemoryPolicy | undefined {
+  if (peerRole === "none") {
+    return undefined;
+  }
+  return { self: { enabled: true }, peer: { enabled: true } };
 }
 
 type IngestBatchResult = {
@@ -1151,6 +1223,11 @@ export function createMemoryOpenVikingContextEngine(params: {
           const client = await getClient();
           const routingRef = assembleParams.sessionId ?? sessionKey ?? OVSessionId;
           const agentId = resolveAgentId(routingRef, sessionKey, OVSessionId);
+          const actorPeerId = cfg.actor_peer_id || resolveSearchActorPeerId({
+            peerRole: cfg.peer_role ?? "none",
+            personPeerId: buildPrefixedPeerId(cfg.peer_prefix ?? "", sender.senderId),
+            assistantPeerId: buildPrefixedPeerId(cfg.peer_prefix ?? "", agentId),
+          });
           const recall = await buildAutoRecallContext({
             cfg,
             client,
@@ -1164,6 +1241,7 @@ export function createMemoryOpenVikingContextEngine(params: {
             ovSessionId: OVSessionId,
             queryTruncated: recallQuery.truncated,
             rawUserTextPreview: recallQuery.query,
+            actorPeerId,
           });
 
           if (!recall.block) {
@@ -1358,7 +1436,16 @@ export function createMemoryOpenVikingContextEngine(params: {
 
         const client = await getClient();
         const createdAt = pickLatestCreatedAt(turnMessages);
-        const senderRoleId = toRoleId(sender.senderId);
+        const peerRole = cfg.peer_role ?? "none";
+        const personPeerId = buildPrefixedPeerId(cfg.peer_prefix ?? "", sender.senderId);
+        const assistantPeerId = buildPrefixedPeerId(cfg.peer_prefix ?? "", agentId);
+        const memoryPolicy = defaultMemoryPolicyForPeerRole(peerRole);
+        if (memoryPolicy) {
+          await client.ensureSessionWithMemoryPolicy(OVSessionId, {
+            agentId,
+            memoryPolicy,
+          });
+        }
         // 发送结构化消息：统一 role 为 user，通过 parts 区分类型
         for (const msg of extractedMessages) {
           const ovParts = msg.parts.map((part) => {
@@ -1388,7 +1475,14 @@ export function createMemoryOpenVikingContextEngine(params: {
               ovParts,
               agentId,
               createdAt,
-              msg.role === "user" ? senderRoleId : undefined,
+              peerRole === "none"
+                ? (msg.role === "user" ? toRoleId(sender.senderId) : undefined)
+                : resolveMessagePeerId({
+                    peerRole,
+                    messageRole: msg.role,
+                    personPeerId,
+                    assistantPeerId,
+                  }),
             );
           }
         }
