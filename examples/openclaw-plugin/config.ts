@@ -6,6 +6,16 @@ export type MemoryOpenVikingConfig = {
   mode?: "remote";
   baseUrl?: string;
   agent_prefix?: string;
+  /** Peer-based memory routing prefix. Legacy agent_prefix is accepted as an alias. */
+  peer_prefix?: string;
+  /** Selects which peer view to use for OpenViking peer-aware memory. */
+  peer_role?: "none" | "assistant" | "person";
+  /** api_key omits tenant headers; trusted allows explicit account/user headers. */
+  authMode?: "api_key" | "trusted";
+  /** New peer-restricted request view; sent as X-OpenViking-Actor-Peer. */
+  actor_peer_id?: string;
+  /** Deprecated OpenViking 0.3 client agent id. Maps to actor_peer_id plus legacy find/message fields. */
+  agent_id?: string;
   apiKey?: string;
   /** Advanced option. Only needed when explicitly sending tenant identity headers. With a user key the server derives identity from the key. */
   accountId?: string;
@@ -104,6 +114,8 @@ const DEFAULT_COMMIT_KEEP_RECENT_COUNT = 10;
 const DEFAULT_BYPASS_SESSION_PATTERNS: string[] = [];
 const DEFAULT_EMIT_STANDARD_DIAGNOSTICS = false;
 const DEFAULT_AGENT_PREFIX = "";
+const DEFAULT_PEER_ROLE = "none" as const;
+const DEFAULT_AUTH_MODE = "api_key" as const;
 const DEFAULT_TRACE_RECALL_DIR = "~/.openclaw/openviking/recall-traces";
 const DEFAULT_TRACE_RECALL_RETENTION_DAYS = 14;
 const DEFAULT_TRACE_RECALL_LOAD_RECENT_DAYS = 2;
@@ -158,6 +170,38 @@ function resolveAgentPrefix(configured: unknown): string {
     return trimmed === "default" ? DEFAULT_AGENT_PREFIX : trimmed;
   }
   return DEFAULT_AGENT_PREFIX;
+}
+
+function resolvePeerPrefix(configured: unknown, legacyAgentPrefix: string): string {
+  if (typeof configured === "string" && configured.trim()) {
+    const trimmed = configured.trim();
+    return trimmed === "default" ? "" : trimmed;
+  }
+  return legacyAgentPrefix;
+}
+
+function resolveOptionalTrimmedString(configured: unknown): string {
+  return typeof configured === "string" && configured.trim() ? configured.trim() : "";
+}
+
+function resolvePeerRole(configured: unknown): "none" | "assistant" | "person" {
+  if (configured === undefined) {
+    return DEFAULT_PEER_ROLE;
+  }
+  if (configured === "none" || configured === "assistant" || configured === "person") {
+    return configured;
+  }
+  throw new Error('openviking peer_role must be "none", "assistant", or "person"');
+}
+
+function resolveAuthMode(configured: unknown): "api_key" | "trusted" {
+  if (configured === undefined) {
+    return DEFAULT_AUTH_MODE;
+  }
+  if (configured === "api_key" || configured === "trusted") {
+    return configured;
+  }
+  throw new Error('openviking authMode must be "api_key" or "trusted"');
 }
 
 function resolveEnvVars(value: string): string {
@@ -335,6 +379,11 @@ export const memoryOpenVikingConfigSchema = {
         "mode",
         "baseUrl",
         "agent_prefix",
+        "peer_prefix",
+        "peer_role",
+        "authMode",
+        "actor_peer_id",
+        "agent_id",
         "agentId",
         "serverAuthMode",
         "apiKey",
@@ -406,6 +455,15 @@ export const memoryOpenVikingConfigSchema = {
       typeof cfg.userId === "string" && cfg.userId.trim()
         ? cfg.userId.trim()
         : (getEnv("OPENVIKING_USER_ID")?.trim() || "");
+    const agentPrefix = resolveAgentPrefix(cfg.agent_prefix);
+    const peerRole = resolvePeerRole(cfg.peer_role ?? getEnv("OPENVIKING_PEER_ROLE"));
+    const authMode = resolveAuthMode(cfg.authMode ?? getEnv("OPENVIKING_AUTH_MODE"));
+    const peerPrefix = resolvePeerPrefix(cfg.peer_prefix ?? getEnv("OPENVIKING_PEER_PREFIX"), agentPrefix);
+    const actorPeerId = resolveOptionalTrimmedString(cfg.actor_peer_id ?? getEnv("OPENVIKING_ACTOR_PEER_ID"));
+    const legacyAgentId = resolveOptionalTrimmedString(cfg.agent_id ?? getEnv("OPENVIKING_AGENT_ID"));
+    if (actorPeerId && legacyAgentId) {
+      throw new Error("openviking actor_peer_id cannot be configured together with legacy agent_id");
+    }
 
     const hasExplicitAgentScopeMode =
       typeof cfg.agentScopeMode === "string" || getEnv("OPENVIKING_AGENT_SCOPE_MODE") !== undefined;
@@ -461,7 +519,12 @@ export const memoryOpenVikingConfigSchema = {
     return {
       mode,
       baseUrl: resolvedBaseUrl,
-      agent_prefix: resolveAgentPrefix(cfg.agent_prefix),
+      agent_prefix: agentPrefix,
+      peer_prefix: peerPrefix,
+      peer_role: peerRole,
+      authMode,
+      actor_peer_id: actorPeerId,
+      agent_id: legacyAgentId,
       apiKey: rawApiKey ? resolveEnvVars(rawApiKey) : "",
       accountId,
       userId,

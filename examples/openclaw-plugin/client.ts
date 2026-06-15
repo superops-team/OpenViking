@@ -186,6 +186,28 @@ export type AddSkillResult = {
   queue_status?: unknown;
 };
 
+export type OpenVikingClientOptions = {
+  authMode?: "api_key" | "trusted";
+  actorPeerId?: string;
+  legacyAgentId?: string;
+};
+
+export type OVMemoryPolicy = {
+  self?: { enabled?: boolean };
+  peer?: { enabled?: boolean };
+  memory_types?: string[];
+};
+
+type RequestMetadata = {
+  actorPeerId?: string;
+  legacyAgentId?: string;
+};
+
+function trimOptional(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed || undefined;
+}
+
 const DEFAULT_WAIT_REQUEST_TIMEOUT_MS = 120_000;
 export const DEFAULT_PHASE2_POLL_TIMEOUT_MS = 300_000;
 const WAIT_REQUEST_TIMEOUT_BUFFER_MS = 5_000;
@@ -239,6 +261,9 @@ async function cleanupUploadTempPath(path?: string): Promise<void> {
 
 export class OpenVikingClient {
   private identityCache = new Map<string, RuntimeIdentity>();
+  private readonly authMode: "api_key" | "trusted";
+  private readonly actorPeerId?: string;
+  private readonly legacyAgentId?: string;
 
   constructor(
     private readonly baseUrl: string,
@@ -252,7 +277,17 @@ export class OpenVikingClient {
     private readonly routingDebugLog?: (message: string) => void,
     private readonly isolateUserScopeByAgent = false,
     private readonly isolateAgentScopeByUser = true,
-  ) {}
+    options: OpenVikingClientOptions = {},
+  ) {
+    this.authMode = options.authMode ?? "api_key";
+    const actorPeerId = trimOptional(options.actorPeerId);
+    const legacyAgentId = trimOptional(options.legacyAgentId);
+    if (actorPeerId && legacyAgentId) {
+      throw new Error("Cannot configure both actorPeerId and legacyAgentId");
+    }
+    this.actorPeerId = actorPeerId ?? legacyAgentId;
+    this.legacyAgentId = legacyAgentId;
+  }
 
   getDefaultAgentId(): string {
     return this.defaultAgentId;
@@ -315,6 +350,7 @@ export class OpenVikingClient {
     init: RequestInit = {},
     agentId?: string,
     requestTimeoutMs?: number,
+    metadata: RequestMetadata = {},
   ): Promise<T> {
     const effectiveAgentId = this.resolveEffectiveAgentId(agentId);
     const controller = new AbortController();
@@ -331,8 +367,15 @@ export class OpenVikingClient {
       if (tenantHeaders.userId) {
         headers.set("X-OpenViking-User", tenantHeaders.userId);
       }
-      if (effectiveAgentId) {
+      const legacyAgentId = metadata.legacyAgentId?.trim();
+      if (legacyAgentId) {
+        headers.set("X-OpenViking-Agent", legacyAgentId);
+      } else if (effectiveAgentId) {
         headers.set("X-OpenViking-Agent", effectiveAgentId);
+      }
+      const actorPeerId = (metadata.actorPeerId ?? this.actorPeerId)?.trim();
+      if (actorPeerId) {
+        headers.set("X-OpenViking-Actor-Peer", actorPeerId);
       }
       if (init.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) {
         headers.set("Content-Type", "application/json");
@@ -429,15 +472,23 @@ export class OpenVikingClient {
     query: string,
     options: {
       targetUri: string;
+      contextType?: "memory" | "resource" | "skill";
+      actorPeerId?: string;
       limit: number;
       scoreThreshold?: number;
     },
     agentId?: string,
   ): Promise<FindResult> {
+    const requestActorPeerId = trimOptional(options.actorPeerId);
+    if (requestActorPeerId && this.legacyAgentId && requestActorPeerId !== this.legacyAgentId) {
+      throw new Error("actorPeerId cannot be used with a different legacyAgentId");
+    }
     const normalizedTargetUri = await this.normalizeTargetUri(options.targetUri, agentId);
     const body = {
       query,
       target_uri: normalizedTargetUri,
+      ...(options.contextType ? { context_type: options.contextType } : {}),
+      ...(this.legacyAgentId ? { agent_id: this.legacyAgentId } : {}),
       limit: options.limit,
       score_threshold: options.scoreThreshold,
     };
@@ -464,7 +515,7 @@ export class OpenVikingClient {
     return this.request<FindResult>("/api/v1/search/find", {
       method: "POST",
       body: JSON.stringify(body),
-    }, agentId);
+    }, agentId, undefined, { actorPeerId: requestActorPeerId });
   }
 
   async read(uri: string, agentId?: string): Promise<string> {
@@ -765,6 +816,28 @@ export class OpenVikingClient {
       },
       agentId,
     );
+  }
+
+  async ensureSessionWithMemoryPolicy(
+    sessionId: string,
+    options: { agentId?: string; memoryPolicy?: OVMemoryPolicy },
+  ): Promise<void> {
+    if (!options.memoryPolicy) {
+      return;
+    }
+    await this.request<{ session_id: string }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}`,
+      {
+        method: "POST",
+        body: JSON.stringify({ memory_policy: options.memoryPolicy }),
+      },
+      options.agentId,
+    ).catch((err) => {
+      if (String(err).includes("HTTP 409")) {
+        return undefined;
+      }
+      throw err;
+    });
   }
 
   /** GET session — server auto-creates if absent; returns session meta including message stats and token usage. */
